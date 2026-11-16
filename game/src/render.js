@@ -1,408 +1,718 @@
-import { COLORS, GRID, H, SIDE, W } from './config.js';
-import { tileConnections } from './tiles.js';
-import { getTile } from './state.js';
+// Tidewire renderer — my own implementation, written from the public interface
+// (main.js calls draw(state, ctx); state.js owns the rules; config.js owns layout).
+// Everything on screen is procedural Canvas 2D: a night-chart sea, switchgear tiles
+// with live pipes, generator / beacon nodes at the board edges, a HUD side panel,
+// and title / win / fail / complete overlays. No images, no network.
+import { GRID, SIDE, W, H, COLORS, DIRS } from './config.js';
+import { tileConnections, tileName } from './tiles.js';
 
-const DIRS = [
-  { x: 0, y: -1 }, { x: 1, y: 0 }, { x: 0, y: 1 }, { x: -1, y: 0 },
-];
+// ---------------------------------------------------------------- helpers
 
-export function draw(state, ctx) {
-  ctx.clearRect(0, 0, W, H);
-  drawBackground(ctx, state);
-  if (state.status === 'title') drawTitle(ctx, state);
-  else drawBoard(ctx, state);
+function rr(ctx, x, y, w, h, r) {
+  const rad = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.closePath();
 }
 
-function drawBackground(ctx, state) {
+function wrapText(ctx, text, maxWidth) {
+  const words = String(text).split(/\s+/);
+  const lines = [];
+  let line = '';
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (ctx.measureText(next).width > maxWidth && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// Deterministic star field, fixed at module load so the sky never flickers.
+const STARS = (() => {
+  let s = 20261116;
+  const rnd = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
+  const out = [];
+  for (let i = 0; i < 90; i++) {
+    out.push({ x: rnd() * W, y: rnd() * 150, r: 0.6 + rnd() * 1.5, a: 0.25 + rnd() * 0.6 });
+  }
+  return out;
+})();
+
+// ---------------------------------------------------------------- geometry
+
+// Centre of a board position. Sources / receivers sit just outside the grid
+// (x = -1 left, x = cols right, y = -1 above, y = rows below); tiles use the
+// same helper so flow edges line up through tile centres.
+function nodeCenter(x, y) {
+  let cx;
+  if (x < 0) cx = GRID.x - 30;
+  else if (x >= GRID.cols) cx = GRID.x + GRID.cols * GRID.cell + (GRID.cols - 1) * GRID.gap + 30;
+  else cx = GRID.x + x * (GRID.cell + GRID.gap) + GRID.cell / 2;
+  let cy;
+  if (y < 0) cy = GRID.y - 30;
+  else if (y >= GRID.rows) cy = GRID.y + GRID.rows * GRID.cell + (GRID.rows - 1) * GRID.gap + 30;
+  else cy = GRID.y + y * (GRID.cell + GRID.gap) + GRID.cell / 2;
+  return { x: cx, y: cy };
+}
+
+function cellRect(x, y) {
+  return {
+    x: GRID.x + x * (GRID.cell + GRID.gap),
+    y: GRID.y + y * (GRID.cell + GRID.gap),
+    w: GRID.cell,
+    h: GRID.cell,
+  };
+}
+
+function pipeColor(tile) {
+  // A storage cell is built to hold 2; only a load past 2 overheats it.
+  // Any other lit tile overheats past 1.
+  if (tile.type === 'storage') {
+    if (tile.load > 2) return COLORS.pathHot;
+    if (!tile.powered) return COLORS.pathOff;
+    return tile.charged ? COLORS.pathStore : COLORS.pathOn;
+  }
+  if (tile.load > 1) return COLORS.pathHot;
+  if (!tile.powered) return COLORS.pathOff;
+  return COLORS.pathOn;
+}
+
+function receiverState(state, recv) {
+  const sim = state.sim;
+  if (sim && sim.receivers) {
+    const hit = sim.receivers.get(recv.id);
+    if (hit) return hit;
+  }
+  return { load: 0, powered: false };
+}
+
+function tileAt(state, x, y) {
+  return state.tiles.get(`${x},${y}`) || null;
+}
+
+// ---------------------------------------------------------------- backdrop
+
+function drawBackground(ctx) {
   const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, COLORS.bg1);
-  g.addColorStop(1, COLORS.bg0);
+  g.addColorStop(0, COLORS.bg0);
+  g.addColorStop(0.55, COLORS.bg1);
+  g.addColorStop(1, '#071120');
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, W, H);
 
-  ctx.save();
-  ctx.globalAlpha = 0.16;
-  ctx.strokeStyle = '#88b7b0';
-  for (let i = 0; i < 9; i++) {
+  for (const s of STARS) {
+    ctx.globalAlpha = s.a;
+    ctx.fillStyle = '#cfe8e2';
     ctx.beginPath();
-    const y = 110 + i * 66;
-    for (let x = 0; x <= W; x += 40) {
-      const yy = y + Math.sin((x + i * 55 + (state.turnsUsed || 0) * 6) * 0.02) * 7;
-      if (x === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Slow swell lines across the top of the chart, purely decorative.
+  ctx.strokeStyle = 'rgba(111, 166, 161, 0.20)';
+  ctx.lineWidth = 2;
+  for (let row = 0; row < 3; row++) {
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += 24) {
+      const y = 118 + row * 16 + Math.sin((x + row * 140) / 190) * 5;
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
     ctx.stroke();
   }
-  ctx.restore();
-
-  ctx.fillStyle = 'rgba(255,255,255,0.05)';
-  for (let i = 0; i < 70; i++) ctx.fillRect((i * 131) % W, (i * 73) % 150, 2, 2);
 }
 
-function drawLighthouse(ctx, x, y, scale, beam = false, lit = false) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.scale(scale, scale);
-  ctx.fillStyle = '#08131d';
-  ctx.beginPath();
-  ctx.moveTo(-70, 40); ctx.quadraticCurveTo(0, 10, 70, 40); ctx.lineTo(70, 70); ctx.lineTo(-70, 70); ctx.closePath();
+function drawHeader(state, ctx) {
+  ctx.fillStyle = COLORS.text;
+  ctx.font = '700 40px Georgia, "Times New Roman", serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText('TIDEWIRE', 70, 62);
+  const titleW = ctx.measureText('TIDEWIRE').width;
+
+  ctx.fillStyle = COLORS.muted;
+  ctx.font = 'italic 17px Georgia, serif';
+  ctx.fillText('a storm-night signal-routing puzzle', 70 + titleW + 16, 60);
+
+  // Scenario pill, top right.
+  const label = `SCENARIO ${state.levelIndex + 1} / 3 — ${state.level.name.toUpperCase()}`;
+  ctx.font = '700 15px Georgia, serif';
+  const tw = ctx.measureText(label).width;
+  const px = W - 70 - tw - 28;
+  rr(ctx, px, 26, tw + 28, 34, 17);
+  ctx.fillStyle = COLORS.panel2;
   ctx.fill();
-  ctx.fillStyle = '#f4efe2';
+  ctx.strokeStyle = COLORS.line;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = COLORS.receiverOn;
+  ctx.fillText(label, px + 14, 49);
+
+  // Thin rule under the header.
+  ctx.strokeStyle = 'rgba(111, 166, 161, 0.45)';
+  ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(-22, 35); ctx.lineTo(22, 35); ctx.lineTo(16, -95); ctx.lineTo(-16, -95); ctx.closePath();
+  ctx.moveTo(70, 84);
+  ctx.lineTo(W - 70, 84);
+  ctx.stroke();
+
+  ctx.fillStyle = COLORS.muted;
+  ctx.font = '15px Georgia, serif';
+  ctx.fillText(state.level.goal, 70, 112);
+}
+
+// ---------------------------------------------------------------- board
+
+function drawTile(ctx, tile, isSelected, canPlay) {
+  const r = cellRect(tile.x, tile.y);
+  const cx = r.x + r.w / 2;
+  const cy = r.y + r.h / 2;
+  const color = pipeColor(tile);
+
+  // Cell body.
+  rr(ctx, r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = tile.powered ? '#16405e' : COLORS.panel;
   ctx.fill();
-  ctx.fillStyle = '#ff6f61';
-  ctx.fillRect(-20, -10, 40, 16);
-  ctx.fillRect(-18, -50, 36, 14);
-  ctx.fillStyle = '#2b4354';
-  ctx.fillRect(-24, -105, 48, 12);
-  ctx.fillStyle = '#f8f3e8';
-  ctx.fillRect(-14, -128, 28, 23);
-  ctx.fillStyle = '#10283b';
-  ctx.beginPath(); ctx.moveTo(-18, -128); ctx.lineTo(0, -150); ctx.lineTo(18, -128); ctx.closePath(); ctx.fill();
-  ctx.fillStyle = lit ? '#fff4bf' : '#8ac9c0';
-  ctx.fillRect(-8, -122, 16, 12);
-  if (beam) {
-    ctx.globalAlpha = 0.22;
-    ctx.fillStyle = '#67f0e4';
-    ctx.beginPath(); ctx.moveTo(8, -116); ctx.lineTo(250, -170); ctx.lineTo(250, -62); ctx.closePath(); ctx.fill();
-    ctx.globalAlpha = 0.9;
-    ctx.strokeStyle = '#9ffaf0';
-    ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.moveTo(8, -116); ctx.lineTo(240, -116); ctx.stroke();
+  ctx.strokeStyle = tile.powered ? color : COLORS.grid;
+  ctx.lineWidth = tile.powered ? 2 : 1;
+  ctx.stroke();
+
+  // Pipes: one arm per connection, centre to the cell edge.
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 11;
+  ctx.lineCap = 'round';
+  for (const d of tileConnections(tile)) {
+    const v = DIRS[d];
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + v.x * (GRID.cell / 2 - 4), cy + v.y * (GRID.cell / 2 - 4));
+    ctx.stroke();
   }
-  ctx.restore();
-}
 
-function drawTitle(ctx) {
-  drawLighthouse(ctx, 170, 520, 1.15, true, true);
-  ctx.save();
-  ctx.globalAlpha = 0.12;
-  ctx.fillStyle = '#5ed8cf';
-  ctx.fillRect(350, 120, 720, 520);
-  ctx.restore();
-  rounded(ctx, 430, 115, 640, 520, 22, 'rgba(11, 34, 51, 0.86)', 'rgba(255,255,255,0.1)');
+  // Hub at the centre.
+  ctx.beginPath();
+  ctx.arc(cx, cy, 14, 0, Math.PI * 2);
+  ctx.fillStyle = '#0d2740';
+  ctx.fill();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  if (tile.type === 'storage') {
+    // Battery body with a charge bar; amber while holding a surge.
+    const bw = 46;
+    const bh = 24;
+    rr(ctx, cx - bw / 2, cy - bh / 2, bw, bh, 5);
+    ctx.fillStyle = tile.charged ? COLORS.pathStore : '#274b5e';
+    ctx.fill();
+    ctx.strokeStyle = COLORS.text;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = '#0d2740';
+    ctx.fillRect(cx + bw / 2, cy - 5, 5, 10);
+    if (tile.charged) {
+      ctx.fillStyle = '#0d2740';
+      ctx.fillRect(cx - bw / 2 + 5, cy - bh / 2 + 5, bw - 16, bh - 10);
+    }
+    if (tile.released) {
+      ctx.strokeStyle = COLORS.pathStore;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 16, cy + 26);
+      ctx.lineTo(cx + 16, cy + 26);
+      ctx.stroke();
+    }
+  }
+
+  if (tile.fixed) {
+    // Bolt heads in the corners mark anchored hardware that cannot rotate.
+    ctx.fillStyle = COLORS.muted;
+    for (const [bx, by] of [[8, 8], [r.w - 8, 8], [8, r.h - 8], [r.w - 8, r.h - 8]]) {
+      ctx.beginPath();
+      ctx.arc(r.x + bx, r.y + by, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Load badge: red and loud only past the tile's real limit (2 for storage, 1 else).
+  if (tile.load > 0) {
+    const hot = tile.type === 'storage' ? tile.load > 2 : tile.load > 1;
+    ctx.beginPath();
+    ctx.arc(r.x + r.w - 16, r.y + 16, 13, 0, Math.PI * 2);
+    ctx.fillStyle = hot ? COLORS.pathHot : COLORS.pathOn;
+    ctx.fill();
+    ctx.fillStyle = '#081625';
+    ctx.font = '700 15px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(tile.load), r.x + r.w - 16, r.y + 17);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  // Type caption along the bottom edge of the cell.
+  ctx.fillStyle = 'rgba(185, 200, 195, 0.85)';
+  ctx.font = '10px Georgia, serif';
   ctx.textAlign = 'center';
-  ctx.fillStyle = COLORS.text;
-  ctx.font = 'bold 72px Georgia, serif';
-  ctx.fillText('TIDEWIRE', 750, 205);
-  ctx.font = 'italic 30px Georgia, serif';
-  ctx.fillStyle = COLORS.pathOn;
-  ctx.fillText('Storm Charts for a Dark Coast', 750, 252);
-  ctx.font = '24px Georgia, serif';
-  ctx.fillStyle = COLORS.text;
-  ctx.fillText('Reconnect the rescue beacons before the storm wins.', 750, 318);
-
+  ctx.fillText(tileName(tile.type).toUpperCase(), cx, r.y + r.h - 9);
   ctx.textAlign = 'left';
-  ctx.font = '20px Georgia, serif';
-  ctx.fillStyle = COLORS.muted;
-  const bullets = [
-    'Rotate switchgear to route live pulses.',
-    'Splitters feed every branch; keep load at 1.',
-    'One storage cell can absorb a single surge.',
-    'Three hand-built scenarios, quick retry, no audio until input.',
-  ];
-  bullets.forEach((line, i) => ctx.fillText(`• ${line}`, 500, 372 + i * 38));
 
-  ctx.textAlign = 'center';
-  ctx.fillStyle = COLORS.accent;
-  ctx.font = 'bold 32px Georgia, serif';
-  ctx.fillText('Press Enter or Click to Start', 750, 540);
-  ctx.fillStyle = COLORS.muted;
-  ctx.font = '18px Georgia, serif';
-  const controls = 'Arrows: select  •  Space/Click: rotate  •  Q: rotate back  •  S: place storage  •  E: release  •  N: retry  •  M: mute';
-  wrapTextCenter(ctx, controls, 750, 582, 560, 24);
+  if (isSelected && canPlay) {
+    rr(ctx, r.x - 4, r.y - 4, r.w + 8, r.h + 8, 15);
+    ctx.strokeStyle = COLORS.focus;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    // Corner ticks so the selection reads even on a lit tile.
+    ctx.strokeStyle = COLORS.focus;
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    const t = 14;
+    const corners = [
+      [r.x - 4, r.y - 4, 1, 1], [r.x + r.w + 4, r.y - 4, -1, 1],
+      [r.x - 4, r.y + r.h + 4, 1, -1], [r.x + r.w + 4, r.y + r.h + 4, -1, -1],
+    ];
+    for (const [x0, y0, sx, sy] of corners) {
+      ctx.beginPath();
+      ctx.moveTo(x0 + sx * t, y0);
+      ctx.lineTo(x0, y0);
+      ctx.lineTo(x0, y0 + sy * t);
+      ctx.stroke();
+    }
+  }
 }
 
-function drawBoard(ctx, state) {
-  drawHud(ctx, state);
-  drawGrid(ctx, state);
-  drawSideboard(ctx, state);
-  if (state.status === 'win' || state.status === 'complete' || state.status === 'fail') drawOverlay(ctx, state);
-}
-
-function drawHud(ctx, state) {
-  rounded(ctx, 54, 28, 1092, 124, 16, 'rgba(10, 31, 47, 0.72)', 'rgba(255,255,255,0.08)');
-  ctx.textAlign = 'left';
-  ctx.fillStyle = COLORS.text;
-  ctx.font = 'bold 34px Georgia, serif';
-  ctx.fillText('TIDEWIRE', 74, 72);
-  ctx.font = '20px Georgia, serif';
-  ctx.fillStyle = COLORS.muted;
-  ctx.fillText(`Scenario ${state.levelIndex + 1}/3: ${state.level.name}`, 74, 102);
-  wrapText(ctx, state.level.goal, 74, 130, 760, 22, 2);
-
-  ctx.textAlign = 'right';
-  ctx.fillStyle = COLORS.text;
-  ctx.font = '22px Georgia, serif';
-  ctx.fillText(`Turns ${state.turnsUsed}/${state.level.maxTurns}`, W - 74, 72);
-  const storageText = !state.level.storageAvailable ? 'Storage: n/a' : state.storageArmed ? 'Storage: armed' : state.storageUsed ? 'Storage: used' : 'Storage: ready';
-  ctx.fillStyle = state.level.storageAvailable ? COLORS.pathStore : COLORS.muted;
-  ctx.fillText(storageText, W - 74, 102);
-  ctx.fillStyle = COLORS.muted;
-  ctx.font = '18px Georgia, serif';
-  ctx.fillText('Mission: power every beacon safely', W - 74, 130);
-}
-
-function drawGrid(ctx, state) {
-  const gx = GRID.x, gy = GRID.y, cell = GRID.cell, gap = GRID.gap;
+function drawEmptyCells(ctx, state) {
   for (let y = 0; y < GRID.rows; y++) {
     for (let x = 0; x < GRID.cols; x++) {
-      const px = gx + x * (cell + gap), py = gy + y * (cell + gap);
-      rounded(ctx, px, py, cell, cell, 14, 'rgba(9, 30, 45, 0.9)', 'rgba(160,210,205,0.12)');
+      if (tileAt(state, x, y)) continue;
+      const r = cellRect(x, y);
+      rr(ctx, r.x, r.y, r.w, r.h, 12);
+      ctx.strokeStyle = 'rgba(170, 215, 210, 0.10)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(170, 215, 210, 0.35)';
+      ctx.beginPath();
+      ctx.arc(r.x + r.w / 2, r.y + r.h / 2, 3, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
-  drawEndpoints(ctx, state);
-  for (let y = 0; y < GRID.rows; y++) for (let x = 0; x < GRID.cols; x++) {
-    const t = getTile(state, x, y); if (t) drawTile(ctx, t);
-  }
-  drawFlow(ctx, state);
-  const sel = state.selected;
-  const spx = gx + sel.x * (cell + gap), spy = gy + sel.y * (cell + gap);
-  ctx.save();
-  ctx.strokeStyle = COLORS.focus; ctx.lineWidth = 4;
-  roundedStroke(ctx, spx - 4, spy - 4, cell + 8, cell + 8, 16);
-  ctx.restore();
-}
-
-function cellCenter(x, y) {
-  return { cx: GRID.x + x * (GRID.cell + GRID.gap) + GRID.cell / 2, cy: GRID.y + y * (GRID.cell + GRID.gap) + GRID.cell / 2 };
-}
-
-function drawEndpoints(ctx, state) {
-  for (const s of state.level.sources) {
-    const edge = edgePoint(s.x, s.y);
-    ctx.fillStyle = COLORS.source;
-    ctx.beginPath(); ctx.arc(edge.x, edge.y, 18, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#0a1c29'; ctx.lineWidth = 3; ctx.stroke();
-    ctx.fillStyle = '#0d2533'; ctx.font = 'bold 14px Georgia, serif'; ctx.textAlign = 'center';
-    ctx.fillText(s.cap > 1 ? `${s.id}${s.cap}` : s.id, edge.x, edge.y + 5);
-  }
-  const simReceivers = state.sim ? state.sim.receivers : new Map();
-  for (const r of state.level.receivers) {
-    const edge = edgePoint(r.x, r.y);
-    const info = simReceivers.get(r.id);
-    const lit = info && info.load >= r.need && info.load <= r.need;
-    const overload = info && info.load > r.need;
-    drawLighthouseIcon(ctx, edge.x, edge.y, lit, overload);
-    ctx.fillStyle = overload ? COLORS.pathHot : lit ? '#102436' : COLORS.text;
-    ctx.font = 'bold 12px Georgia, serif'; ctx.textAlign = 'center';
-    ctx.fillText(r.id, edge.x, edge.y + 28);
-  }
-}
-
-function drawLighthouseIcon(ctx, x, y, lit, overload) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.fillStyle = overload ? COLORS.pathHot : lit ? COLORS.receiverOn : '#3d5d70';
-  ctx.beginPath(); ctx.moveTo(-10, 14); ctx.lineTo(10, 14); ctx.lineTo(7, -12); ctx.lineTo(-7, -12); ctx.closePath(); ctx.fill();
-  ctx.fillStyle = overload ? '#5b130d' : lit ? '#26495c' : '#203645';
-  ctx.fillRect(-8, -2, 16, 4);
-  ctx.fillStyle = '#152735'; ctx.fillRect(-11, -16, 22, 5);
-  ctx.fillStyle = overload ? '#ffd0c8' : lit ? '#fff4bf' : '#88aab8';
-  ctx.fillRect(-5, -23, 10, 7);
-  ctx.fillStyle = '#152735';
-  ctx.beginPath(); ctx.moveTo(-8, -23); ctx.lineTo(0, -30); ctx.lineTo(8, -23); ctx.closePath(); ctx.fill();
-  if (lit && !overload) {
-    ctx.strokeStyle = 'rgba(103,240,228,0.9)'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(5, -19); ctx.lineTo(26, -19); ctx.stroke();
-  }
-  ctx.restore();
-}
-
-function edgePoint(x, y) {
-  const b = { x: GRID.x, y: GRID.y, w: GRID.cols * (GRID.cell + GRID.gap) - GRID.gap, h: GRID.rows * (GRID.cell + GRID.gap) - GRID.gap };
-  if (x === -1) return { x: b.x - 24, y: GRID.y + y * (GRID.cell + GRID.gap) + GRID.cell / 2 };
-  if (x === GRID.cols) return { x: b.x + b.w + 24, y: GRID.y + y * (GRID.cell + GRID.gap) + GRID.cell / 2 };
-  if (y === -1) return { x: GRID.x + x * (GRID.cell + GRID.gap) + GRID.cell / 2, y: b.y - 24 };
-  if (y === GRID.rows) return { x: GRID.x + x * (GRID.cell + GRID.gap) + GRID.cell / 2, y: b.y + b.h + 24 };
-  return cellCenter(x, y);
-}
-
-function drawTile(ctx, t) {
-  const { cx, cy } = cellCenter(t.x, t.y);
-  const size = GRID.cell - 18;
-  const conns = tileConnections(t);
-  const hot = t.load > 1;
-  const on = t.powered;
-  const base = t.fixed ? '#18394d' : '#0f2b3f';
-  rounded(ctx, cx - size / 2, cy - size / 2, size, size, 12, base, hot ? COLORS.pathHot : on ? 'rgba(71,214,207,0.55)' : 'rgba(255,255,255,0.08)');
-
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.lineCap = 'round';
-  for (const d of conns) {
-    const v = DIRS[d];
-    ctx.strokeStyle = hot ? COLORS.pathHot : on ? COLORS.pathOn : 'rgba(75,110,128,0.65)';
-    ctx.lineWidth = hot || on ? 12 : 9;
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(v.x * (size / 2 - 7), v.y * (size / 2 - 7));
-    ctx.stroke();
-  }
-  ctx.fillStyle = hot ? COLORS.pathHot : on ? COLORS.pathOn : '#294a5e';
-  ctx.beginPath(); ctx.arc(0, 0, 12, 0, Math.PI * 2); ctx.fill();
-
-  ctx.fillStyle = COLORS.text;
-  ctx.font = 'bold 13px Georgia, serif';
-  ctx.textAlign = 'center';
-  let label = t.type === 'straight' ? 'I' : t.type === 'corner' ? 'L' : t.type === 'splitT' ? 'T' : 'S';
-  if (t.type === 'storage') label = t.released ? 'R' : t.charged ? 'C' : 'B';
-  ctx.fillText(label, 0, 4);
-  if (t.fixed) { ctx.fillStyle = COLORS.muted; ctx.font = '11px Georgia, serif'; ctx.fillText('FIXED', 0, 26); }
-  ctx.restore();
 }
 
 function drawFlow(ctx, state) {
-  const sim = state.sim; if (!sim) return;
+  const sim = state.sim;
+  if (!sim || !sim.flowEdges || sim.flowEdges.length === 0) return;
   ctx.save();
+  ctx.lineCap = 'round';
+  ctx.setLineDash([12, 16]);
+  ctx.lineDashOffset = -(Date.now() / 45) % 28;
   for (const e of sim.flowEdges) {
-    if (e.x1 == null) continue;
-    const p1 = pointFor(e.x1, e.y1, e.x2, e.y2);
-    const p2 = pointFor(e.x2, e.y2, e.x1, e.y1);
-    if (!p1 || !p2) continue;
-    const hot = e.amount > 1;
-    ctx.strokeStyle = hot ? 'rgba(255,127,102,0.95)' : 'rgba(150,255,245,0.95)';
-    ctx.lineWidth = hot ? 5 : 3.5;
-    ctx.shadowColor = hot ? COLORS.pathHot : COLORS.pathOn;
-    ctx.shadowBlur = hot ? 14 : 10;
-    ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    const a = nodeCenter(e.x1, e.y1);
+    const b = nodeCenter(e.x2, e.y2);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.strokeStyle = e.amount > 1 ? COLORS.pathHot : COLORS.pathOn;
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = 5;
+    ctx.stroke();
   }
   ctx.restore();
 }
 
-function pointFor(x, y, tx, ty) {
-  if (x >= 0 && x < GRID.cols && y >= 0 && y < GRID.rows) {
-    const c = cellCenter(x, y);
-    const dx = Math.sign(tx - x), dy = Math.sign(ty - y);
-    return { x: c.cx + dx * (GRID.cell / 2 - 12), y: c.cy + dy * (GRID.cell / 2 - 12) };
+// ---------------------------------------------------------------- nodes
+
+function drawSource(ctx, state, src) {
+  const c = nodeCenter(src.x, src.y);
+  const out = tileAt(state, src.x + DIRS[src.dir].x, src.y + DIRS[src.dir].y);
+  const live = !!(out && out.powered);
+
+  if (live) {
+    ctx.save();
+    ctx.shadowColor = COLORS.source;
+    ctx.shadowBlur = 22;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 24, 0, Math.PI * 2);
+    ctx.fillStyle = '#123f31';
+    ctx.fill();
+    ctx.restore();
+  } else {
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 24, 0, Math.PI * 2);
+    ctx.fillStyle = '#123f31';
+    ctx.fill();
   }
-  if (x === -1) return { x: GRID.x - 24, y: GRID.y + y * (GRID.cell + GRID.gap) + GRID.cell / 2 };
-  if (x === GRID.cols) return { x: GRID.x + GRID.cols * (GRID.cell + GRID.gap) - GRID.gap + 24, y: GRID.y + y * (GRID.cell + GRID.gap) + GRID.cell / 2 };
-  if (y === -1) return { x: GRID.x + x * (GRID.cell + GRID.gap) + GRID.cell / 2, y: GRID.y - 24 };
-  if (y === GRID.rows) return { x: GRID.x + x * (GRID.cell + GRID.gap) + GRID.cell / 2, y: GRID.y + GRID.rows * (GRID.cell + GRID.gap) - GRID.gap + 24 };
-  return null;
+  ctx.strokeStyle = live ? COLORS.source : COLORS.line;
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  ctx.fillStyle = live ? COLORS.source : COLORS.text;
+  ctx.font = '700 20px Georgia, serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(src.id, c.x, c.y + 1);
+
+  // Capacity pips under the node.
+  ctx.fillStyle = COLORS.muted;
+  ctx.font = '11px Georgia, serif';
+  ctx.fillText(`GEN · ${src.cap}`, c.x, c.y + 38);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  // Arrow showing which way the feed enters the board.
+  const v = DIRS[src.dir];
+  const ax = c.x + v.x * 34;
+  const ay = c.y + v.y * 34;
+  ctx.fillStyle = live ? COLORS.source : COLORS.muted;
+  ctx.beginPath();
+  ctx.moveTo(ax + v.x * 10, ay + v.y * 10);
+  ctx.lineTo(ax - v.y * 6 - v.x * 4, ay - v.x * 6 - v.y * 4);
+  ctx.lineTo(ax + v.y * 6 - v.x * 4, ay + v.x * 6 - v.y * 4);
+  ctx.closePath();
+  ctx.fill();
 }
 
-function drawSideboard(ctx, state) {
-  rounded(ctx, SIDE.x, SIDE.y, SIDE.w, SIDE.h, 18, 'rgba(12, 34, 50, 0.94)', 'rgba(255,255,255,0.09)');
-  ctx.save();
-  ctx.beginPath(); ctx.rect(SIDE.x + 8, SIDE.y + 8, SIDE.w - 16, SIDE.h - 16); ctx.clip();
-  ctx.fillStyle = COLORS.text; ctx.textAlign = 'left';
-  ctx.font = 'bold 24px Georgia, serif';
-  ctx.fillText('Mission Panel', SIDE.x + 20, SIDE.y + 36);
+function drawReceiver(ctx, state, recv) {
+  const c = nodeCenter(recv.x, recv.y);
+  const rs = receiverState(state, recv);
+  const lit = rs.load >= recv.need && rs.load > 0;
 
-  ctx.font = '16px Georgia, serif'; ctx.fillStyle = COLORS.muted;
-  let y = wrapText(ctx, state.level.briefing, SIDE.x + 20, SIDE.y + 64, SIDE.w - 40, 21, 3) + 6;
-
-  y = sectionTitle(ctx, 'Beacons', SIDE.x + 20, y);
-  ctx.font = '15px Georgia, serif';
-  const simReceivers = state.sim ? state.sim.receivers : new Map();
-  for (const r of state.level.receivers) {
-    const info = simReceivers.get(r.id);
-    const lit = info && info.load >= r.need && info.load <= r.need;
-    const overload = info && info.load > r.need;
-    ctx.fillStyle = overload ? COLORS.pathHot : lit ? COLORS.pathOn : COLORS.muted;
-    const status = overload ? `OVERLOAD ${info.load}` : lit ? 'LIT' : `waiting ${info ? info.load : 0}/${r.need}`;
-    y = wrapText(ctx, `${r.id} ${r.label}: ${status}`, SIDE.x + 20, y, SIDE.w - 40, 20, 2) + 2;
+  if (lit) {
+    ctx.save();
+    ctx.shadowColor = COLORS.receiverOn;
+    ctx.shadowBlur = 26;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 24, 0, Math.PI * 2);
+    ctx.fillStyle = '#4a3a1c';
+    ctx.fill();
+    ctx.restore();
+    // Light rays from a lit beacon.
+    ctx.strokeStyle = 'rgba(255, 233, 176, 0.55)';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    for (const ang of [-0.6, 0, 0.6]) {
+      const dx = Math.cos(ang - Math.PI / 2);
+      const dy = Math.sin(ang - Math.PI / 2);
+      ctx.beginPath();
+      ctx.moveTo(c.x + dx * 28, c.y + dy * 28);
+      ctx.lineTo(c.x + dx * 46, c.y + dy * 46);
+      ctx.stroke();
+    }
+  } else {
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 24, 0, Math.PI * 2);
+    ctx.fillStyle = COLORS.receiverOff;
+    ctx.fill();
   }
-  y += 4;
-  y = sectionTitle(ctx, 'Relay Report', SIDE.x + 20, y);
-  ctx.font = '15px Georgia, serif';
-  ctx.fillStyle = state.status === 'fail' ? COLORS.pathHot : COLORS.text;
-  y = wrapText(ctx, state.message || state.level.hint, SIDE.x + 20, y, SIDE.w - 40, 20, 4) + 4;
+  ctx.strokeStyle = lit ? COLORS.receiverOn : COLORS.line;
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
 
-  y = sectionTitle(ctx, 'Controls', SIDE.x + 20, y);
-  ctx.font = '14px Georgia, serif'; ctx.fillStyle = COLORS.muted;
-  const controls = [
-    'Arrows: move selection',
-    'Space / Click: rotate selected',
-    'Q: rotate back',
-    'S: place storage',
-    'E: release storage',
-    'N: retry scenario',
-    'M: mute audio',
-  ];
-  for (const c of controls) y = wrapText(ctx, c, SIDE.x + 20, y, SIDE.w - 40, 19, 1) + 1;
-  ctx.restore();
+  // Little lighthouse tower inside the node.
+  ctx.fillStyle = lit ? '#ffe9b0' : '#8fa8b5';
+  ctx.beginPath();
+  ctx.moveTo(c.x - 7, c.y + 10);
+  ctx.lineTo(c.x - 4, c.y - 8);
+  ctx.lineTo(c.x + 4, c.y - 8);
+  ctx.lineTo(c.x + 7, c.y + 10);
+  ctx.closePath();
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(c.x, c.y - 11, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Labels stay out of the tiles and the header goal line:
+  //  - top-edge beacons: name + load stacked left of the node, above the board;
+  //  - right-edge beacons: stacked under the node, clear of the tile captions;
+  //  - bottom-edge beacons: centred under the node (the message bar is narrow).
+  ctx.textBaseline = 'middle';
+  if (recv.y < 0) {
+    ctx.textAlign = 'right';
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.text;
+    ctx.font = '700 13px Georgia, serif';
+    ctx.fillText(recv.label, c.x - 34, c.y - 3);
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.muted;
+    ctx.font = '12px Georgia, serif';
+    ctx.fillText(`${clamp(rs.load, 0, 99)}/${recv.need}`, c.x - 34, c.y + 13);
+  } else if (recv.x >= GRID.cols) {
+    ctx.textAlign = 'right';
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.text;
+    ctx.font = '700 13px Georgia, serif';
+    ctx.fillText(recv.label, 852, c.y + 62);
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.muted;
+    ctx.font = '12px Georgia, serif';
+    ctx.fillText(`${clamp(rs.load, 0, 99)}/${recv.need}`, 852, c.y + 78);
+  } else {
+    const labelY = c.y + 40;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.text;
+    ctx.font = '700 13px Georgia, serif';
+    ctx.fillText(recv.label, c.x, labelY);
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.muted;
+    ctx.font = '12px Georgia, serif';
+    ctx.fillText(`${clamp(rs.load, 0, 99)}/${recv.need}`, c.x, labelY + 16);
+  }
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
 }
+
+function drawBoard(state, ctx) {
+  // Board plate.
+  rr(ctx, GRID.x - 24, GRID.y - 24, GRID.cols * GRID.cell + (GRID.cols - 1) * GRID.gap + 48,
+    GRID.rows * GRID.cell + (GRID.rows - 1) * GRID.gap + 48, 18);
+  ctx.fillStyle = 'rgba(16, 38, 58, 0.55)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(111, 166, 161, 0.35)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  drawEmptyCells(ctx, state);
+  const canPlay = state.status === 'play';
+  for (const tile of state.tiles.values()) {
+    const isSelected = state.selected && state.selected.x === tile.x && state.selected.y === tile.y;
+    drawTile(ctx, tile, isSelected, canPlay);
+  }
+  drawFlow(ctx, state);
+  for (const src of state.level.sources) drawSource(ctx, state, src);
+  for (const recv of state.level.receivers) drawReceiver(ctx, state, recv);
+}
+
+// ---------------------------------------------------------------- side panel
 
 function sectionTitle(ctx, text, x, y) {
-  ctx.fillStyle = COLORS.text; ctx.font = 'bold 18px Georgia, serif';
+  ctx.fillStyle = COLORS.line;
+  ctx.font = '700 13px Georgia, serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
   ctx.fillText(text, x, y);
-  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-  ctx.beginPath(); ctx.moveTo(x, y + 6); ctx.lineTo(x + 230, y + 6); ctx.stroke();
-  return y + 26;
+  ctx.strokeStyle = 'rgba(111, 166, 161, 0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x, y + 7);
+  ctx.lineTo(x + SIDE.w - 40, y + 7);
+  ctx.stroke();
 }
 
-function drawOverlay(ctx, state) {
-  ctx.save();
-  ctx.fillStyle = 'rgba(4, 14, 22, 0.66)'; ctx.fillRect(0, 0, W, H);
-  const title = state.status === 'fail' ? 'ROUTE FAILED' : state.status === 'complete' ? 'COAST RESTORED' : 'BEACON RESTORED';
-  const accent = state.status === 'fail' ? COLORS.pathHot : COLORS.pathOn;
-  rounded(ctx, 250, 175, 700, 340, 18, 'rgba(12, 34, 50, 0.96)', accent);
+function drawSidePanel(state, ctx) {
+  rr(ctx, SIDE.x, SIDE.y, SIDE.w, SIDE.h, 16);
+  ctx.fillStyle = COLORS.panel;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(111, 166, 161, 0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  const x = SIDE.x + 20;
+  const inner = SIDE.w - 40;
+  let y = SIDE.y + 30;
+
+  sectionTitle(ctx, 'SCENARIO', x, y);
+  y += 30;
+  ctx.fillStyle = COLORS.text;
+  ctx.font = '700 24px Georgia, serif';
+  ctx.fillText(state.level.name, x, y);
+  y += 12;
+  ctx.fillStyle = COLORS.muted;
+  ctx.font = '14px Georgia, serif';
+  for (const line of wrapText(ctx, state.level.briefing, inner)) {
+    y += 19;
+    ctx.fillText(line, x, y);
+  }
+
+  y += 28;
+  sectionTitle(ctx, 'BEACONS', x, y);
+  y += 28;
+  for (const recv of state.level.receivers) {
+    const rs = receiverState(state, recv);
+    const lit = rs.load >= recv.need && rs.load > 0;
+    ctx.beginPath();
+    ctx.arc(x + 8, y - 5, 7, 0, Math.PI * 2);
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.receiverOff;
+    ctx.fill();
+    ctx.strokeStyle = lit ? COLORS.receiverOn : COLORS.line;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = lit ? COLORS.text : COLORS.muted;
+    ctx.font = '15px Georgia, serif';
+    ctx.fillText(recv.label, x + 24, y);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = lit ? COLORS.receiverOn : COLORS.muted;
+    ctx.fillText(`${clamp(rs.load, 0, 99)}/${recv.need}`, x + inner, y);
+    ctx.textAlign = 'left';
+    y += 26;
+  }
+
+  y += 10;
+  sectionTitle(ctx, 'TURNS', x, y);
+  y += 28;
+  ctx.fillStyle = COLORS.text;
+  ctx.font = '700 18px Georgia, serif';
+  ctx.fillText(`${state.turnsUsed} / ${state.level.maxTurns}`, x, y);
+  const barX = x + 92;
+  const barW = inner - 92;
+  rr(ctx, barX, y - 13, barW, 10, 5);
+  ctx.fillStyle = '#0a1c2c';
+  ctx.fill();
+  const frac = clamp(state.turnsUsed / state.level.maxTurns, 0, 1);
+  if (frac > 0) {
+    rr(ctx, barX, y - 13, Math.max(10, barW * frac), 10, 5);
+    ctx.fillStyle = frac >= 1 ? COLORS.pathHot : COLORS.pathOn;
+    ctx.fill();
+  }
+
+  if (state.level.storageAvailable) {
+    y += 34;
+    sectionTitle(ctx, 'STORAGE', x, y);
+    y += 26;
+    let storageTile = null;
+    for (const t of state.tiles.values()) if (t.type === 'storage') storageTile = t;
+    let status;
+    if (!storageTile) status = state.storageUsed ? 'Released — spent.' : 'Ready — press S on a tile to place.';
+    else if (storageTile.released) status = 'Released — surge fed back to the route.';
+    else if (storageTile.charged) status = 'Charged — holding 1 surge. Press E to release.';
+    else status = 'Armed on the grid — waiting for a surge.';
+    ctx.fillStyle = storageTile && storageTile.charged ? COLORS.pathStore : COLORS.muted;
+    ctx.font = '14px Georgia, serif';
+    for (const line of wrapText(ctx, status, inner)) {
+      ctx.fillText(line, x, y);
+      y += 19;
+    }
+    y -= 19;
+  }
+
+  y += 34;
+  sectionTitle(ctx, 'CONTROLS', x, y);
+  y += 24;
+  ctx.fillStyle = COLORS.muted;
+  ctx.font = '13.5px Georgia, serif';
+  const controls = [
+    'Arrows — move selection',
+    'Space / Click — rotate tile',
+    'Q — rotate counter-clockwise',
+    'S — place storage · E — release',
+    'N — retry · M — mute · Enter — go',
+  ];
+  for (const line of controls) {
+    ctx.fillText(line, x, y);
+    y += 20;
+  }
+
+  // Hint pinned near the bottom of the panel.
+  ctx.fillStyle = COLORS.muted;
+  ctx.font = 'italic 13.5px Georgia, serif';
+  const hintY = SIDE.y + SIDE.h - 18;
+  const hintLines = wrapText(ctx, state.level.hint, inner);
+  hintLines.forEach((line, i) => {
+    ctx.fillText(line, x, hintY - (hintLines.length - 1 - i) * 18);
+  });
+}
+
+function drawMessage(state, ctx) {
+  ctx.fillStyle = COLORS.text;
+  ctx.font = '16px Georgia, serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  // Kept narrow (x <= ~540) so it never runs under a bottom-edge beacon label.
+  const lines = wrapText(ctx, `» ${state.message}`, 470);
+  lines.forEach((line, i) => {
+    ctx.fillText(line, 70, 722 + i * 20);
+  });
+}
+
+// ---------------------------------------------------------------- overlays
+
+function overlayPanel(ctx, title, titleColor, lines, prompt) {
+  ctx.fillStyle = 'rgba(4, 12, 20, 0.74)';
+  ctx.fillRect(0, 0, W, H);
+
+  const pw = 720;
+  const ph = 150 + lines.length * 26 + 74;
+  const px = (W - pw) / 2;
+  const py = (H - ph) / 2;
+  rr(ctx, px, py, pw, ph, 20);
+  ctx.fillStyle = COLORS.panel;
+  ctx.fill();
+  ctx.strokeStyle = COLORS.line;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
   ctx.textAlign = 'center';
-  ctx.fillStyle = accent; ctx.font = 'bold 48px Georgia, serif'; ctx.fillText(title, W / 2, 262);
-  ctx.fillStyle = COLORS.text; ctx.font = '24px Georgia, serif';
-  wrapTextCenter(ctx, state.message, W / 2, 318, 580, 30, 4);
-  ctx.fillStyle = COLORS.muted; ctx.font = '20px Georgia, serif';
-  const prompt = state.status === 'fail' ? 'Press N or Click to Retry' : state.status === 'complete' ? 'Press Enter or Click to Replay' : 'Press Enter or Click for Next Sector';
-  ctx.fillText(prompt, W / 2, 470);
+  ctx.fillStyle = titleColor;
+  ctx.font = '700 46px Georgia, "Times New Roman", serif';
+  ctx.fillText(title, W / 2, py + 74);
+
+  ctx.fillStyle = COLORS.text;
+  ctx.font = '17px Georgia, serif';
+  let y = py + 116;
+  for (const line of lines) {
+    ctx.fillText(line, W / 2, y);
+    y += 26;
+  }
+
+  ctx.fillStyle = COLORS.receiverOn;
+  ctx.font = '700 16px Georgia, serif';
+  ctx.fillText(prompt, W / 2, py + ph - 28);
+  ctx.textAlign = 'left';
+}
+
+function drawOverlay(state, ctx) {
+  if (state.status === 'title') {
+    const lines = wrapTextIn(ctx, state.level.briefing, 620);
+    overlayPanel(ctx, 'TIDEWIRE', COLORS.text, [
+      ...lines,
+      '',
+      'Rotate the switchgear so the live pulse reaches every beacon.',
+      'Keep every lit relay at load 1 — overloads sink the circuit.',
+    ], 'Press Enter or click to begin');
+    return;
+  }
+  if (state.status === 'win') {
+    overlayPanel(ctx, 'BEACON RESTORED', COLORS.receiverOn, [
+      `${state.level.name} is lit again.`,
+      'The next sector of coast is still dark.',
+    ], 'Press Enter for the next scenario');
+    return;
+  }
+  if (state.status === 'fail') {
+    overlayPanel(ctx, 'SIGNAL LOST', COLORS.pathHot, [
+      state.failReason || state.message,
+      `Turns used: ${state.turnsUsed} / ${state.level.maxTurns}.`,
+    ], 'Press N or Enter to retry');
+    return;
+  }
+  if (state.status === 'complete') {
+    overlayPanel(ctx, 'COAST RESTORED', COLORS.receiverOn, [
+      'All three rescue beacons shine again across the coast.',
+      'Harbor, pier, jetty, cliff and cove — every light is home.',
+    ], 'Press Enter to play again from the first scenario');
+  }
+}
+
+function wrapTextIn(ctx, text, maxWidth) {
+  ctx.font = '17px Georgia, serif';
+  return wrapText(ctx, text, maxWidth);
+}
+
+// ---------------------------------------------------------------- entry
+
+export function draw(state, ctx) {
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  drawBackground(ctx);
+  drawHeader(state, ctx);
+  drawBoard(state, ctx);
+  drawSidePanel(state, ctx);
+  drawMessage(state, ctx);
+  if (state.status !== 'play') drawOverlay(state, ctx);
   ctx.restore();
-}
-
-function rounded(ctx, x, y, w, h, r, fill, stroke) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
-  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
-}
-function roundedStroke(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); ctx.stroke();
-}
-
-function wrapText(ctx, text, x, y, maxW, lh, maxLines = 99) {
-  const words = String(text).split(/\s+/).filter(Boolean);
-  let line = '';
-  let lines = 0;
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    const test = line ? line + ' ' + w : w;
-    if (ctx.measureText(test).width > maxW && line) {
-      ctx.fillText(line, x, y); y += lh; line = w; lines++;
-      if (lines >= maxLines - 1 && i < words.length - 1) {
-        let rest = line;
-        while (ctx.measureText(rest + '…').width > maxW && rest.length > 1) rest = rest.slice(0, -1);
-        ctx.fillText(rest + '…', x, y); return y + lh;
-      }
-    } else line = test;
-  }
-  if (line && lines < maxLines) { ctx.fillText(line, x, y); y += lh; }
-  return y;
-}
-
-function wrapTextCenter(ctx, text, cx, y, maxW, lh, maxLines = 99) {
-  const words = String(text).split(/\s+/).filter(Boolean);
-  let line = '';
-  let lines = 0;
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    const test = line ? line + ' ' + w : w;
-    if (ctx.measureText(test).width > maxW && line) {
-      ctx.fillText(line, cx, y); y += lh; line = w; lines++;
-      if (lines >= maxLines - 1 && i < words.length - 1) {
-        let rest = line;
-        while (ctx.measureText(rest + '…').width > maxW && rest.length > 1) rest = rest.slice(0, -1);
-        ctx.fillText(rest + '…', cx, y); return y + lh;
-      }
-    } else line = test;
-  }
-  if (line && lines < maxLines) { ctx.fillText(line, cx, y); y += lh; }
-  return y;
 }

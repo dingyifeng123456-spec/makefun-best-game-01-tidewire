@@ -14,7 +14,7 @@
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -26,6 +26,33 @@ mkdirSync(out, { recursive: true });
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
 mkdirSync(join(out, 'screenshots'), { recursive: true });
 if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+
+// Post-copy integrity check: the dossier is only as good as the tree it
+// describes, so verify the copy before anything is scored. Every file under
+// game/ must arrive in /output/game with the same relative path and byte size
+// (a truncated or silently dropped module would otherwise ship unnoticed),
+// and the entry files the browser actually loads must be present and non-empty.
+function listFiles(root, rel = '') {
+  const found = [];
+  for (const entry of readdirSync(join(root, rel), { withFileTypes: true })) {
+    const p = rel ? `${rel}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) found.push(...listFiles(root, p));
+    else if (entry.isFile()) found.push(p);
+  }
+  return found.sort();
+}
+const srcGame = join(here, 'game');
+const dstGame = join(out, 'game');
+for (const rel of listFiles(srcGame)) {
+  const a = statSync(join(srcGame, rel));
+  const b = statSync(join(dstGame, rel), { throwIfNoEntry: false });
+  if (!b) throw new Error(`main.ts: game/${rel} was not copied to the output tree`);
+  if (a.size !== b.size) throw new Error(`main.ts: game/${rel} copied with wrong size (${b.size} != ${a.size} bytes)`);
+}
+for (const rel of ['index.html', 'src/main.js', 'src/render.js', 'src/state.js', 'src/levels.js', 'src/tiles.js', 'src/config.js', 'src/audio.js', 'src/style.css']) {
+  const s = statSync(join(dstGame, rel), { throwIfNoEntry: false });
+  if (!s || s.size === 0) throw new Error(`main.ts: required game file ${rel} missing or empty in the output tree`);
+}
 
 // The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
 // scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game

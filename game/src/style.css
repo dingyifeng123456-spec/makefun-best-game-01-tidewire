@@ -1,0 +1,33 @@
+:root {
+  color-scheme: dark;
+}
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #081625;
+  font-family: Georgia, "Times New Roman", serif;
+}
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#app {
+  position: relative;
+  width: min(100vw, 1200px);
+  aspect-ratio: 1200 / 750;
+}
+#game {
+  width: 100%;
+  height: 100%;
+  display: block;
+  outline: none;
+  background: #081625;
+}
+#ui {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
